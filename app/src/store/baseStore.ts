@@ -6,6 +6,7 @@ import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMediaQuery } from 'usehooks-ts';
 import { useNavigate, useLocation, useSearchParams } from 'react-router-dom';
+import { eventBus } from '@/lib/event';
 export class BaseStore implements Store {
   sid = 'BaseStore';
   constructor() {
@@ -132,8 +133,14 @@ export class BaseStore implements Store {
     };
 
     useEffect(() => {
-      const handleOnline = () => this.setOnlineStatus(true);
-      const handleOffline = () => this.setOnlineStatus(false);
+      const handleOnline = () => {
+        this.setOnlineStatus(true);
+        eventBus.emit('app:online');
+      };
+      const handleOffline = () => {
+        this.setOnlineStatus(false);
+        eventBus.emit('app:offline');
+      };
 
       window.addEventListener('online', handleOnline);
       window.addEventListener('offline', handleOffline);

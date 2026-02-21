@@ -16,6 +16,12 @@ import { UserStore } from './user';
 import { BaseStore } from './baseStore';
 import { StorageState } from './standard/StorageState';
 import { useSearchParams, useLocation } from 'react-router-dom';
+import {
+  cacheNotes, getCachedNotes, getCachedNote,
+  saveNoteLocally, getDirtyNotes, markSynced,
+  cacheTags, getCachedTags, clearOfflineData,
+  type CachedNote
+} from '@/lib/offlineDB';
 
 type filterType = {
   label: string;
@@ -152,30 +158,46 @@ export class BlinkoStore implements Store {
     let notes: Note[] = [];
 
     if (this.isOnline) {
-      const queryParams = { 
-        ...this.noteListFilterConfig, 
+      const queryParams = {
+        ...this.noteListFilterConfig,
         ...filterConfig,
-        searchText: this.searchText, 
-        page, 
-        size 
+        searchText: this.searchText,
+        page,
+        size
       };
       notes = await api.notes.list.mutate(queryParams);
 
-      
+      // Cache fetched notes to IndexedDB for offline access
+      cacheNotes(notes).catch(err => console.warn('Failed to cache notes:', err));
+
       if (this.offlineNotes.length > 0) {
         await this.syncOfflineNotes();
       }
+      await this.syncDirtyNotes();
+    } else {
+      // Offline: read from IndexedDB cache
+      const cachedNotes = await getCachedNotes({
+        type: filterConfig.type,
+        isArchived: filterConfig.isArchived,
+        isRecycle: filterConfig.isRecycle,
+        searchText: this.searchText,
+        page,
+        size,
+      });
+      notes = cachedNotes as unknown as Note[];
     }
 
     const filteredOfflineNotes = this.offlineNotes.filter(offlineFilter);
-    const mergedNotes = [...filteredOfflineNotes, ...notes].map(i => ({ ...i, isExpand: false }));
 
     if (!this.isOnline) {
-      const start = (page - 1) * size;
-      const end = start + size;
-      return mergedNotes.slice(start, end);
+      // Merge localStorage offline notes with IndexedDB cached notes, deduplicate
+      const noteMap = new Map<number, any>();
+      for (const n of notes) noteMap.set(n.id!, n);
+      for (const n of filteredOfflineNotes) noteMap.set(n.id, n);
+      return Array.from(noteMap.values()).map(i => ({ ...i, isExpand: false }));
     }
 
+    const mergedNotes = [...filteredOfflineNotes, ...notes].map(i => ({ ...i, isExpand: false }));
     return mergedNotes;
   }
 
@@ -202,8 +224,9 @@ export class BlinkoStore implements Store {
 
       if (!this.isOnline && !id) {
         const now = new Date();
+        const tempId = now.getTime();
         const offlineNote: OfflineNote = {
-          id: now.getTime(),
+          id: tempId,
           content: content || '',
           type,
           isArchived: !!isArchived,
@@ -221,8 +244,41 @@ export class BlinkoStore implements Store {
         };
 
         this.saveOfflineNote(offlineNote);
+        // Also save to IndexedDB for offline viewing
+        saveNoteLocally({
+          ...offlineNote,
+          isReviewed: false,
+          _dirty: true,
+          _syncAction: 'create',
+          _isOfflineCreated: true,
+        } as CachedNote).catch(err => console.warn('Failed to save offline note to IndexedDB:', err));
         showToast && RootStore.Get(ToastPlugin).success(i18n.t("create-successfully") + '-' + i18n.t("offline-status"));
         return offlineNote;
+      }
+
+      // Offline edit of existing note
+      if (!this.isOnline && id) {
+        const existingNote = await getCachedNote(id);
+        if (existingNote) {
+          const updatedNote: CachedNote = {
+            ...existingNote,
+            content: content !== null && content !== undefined ? content : existingNote.content,
+            type: type !== undefined ? type : existingNote.type,
+            isArchived: isArchived !== undefined ? !!isArchived : existingNote.isArchived,
+            isRecycle: isRecycle !== undefined ? !!isRecycle : existingNote.isRecycle,
+            isTop: isTop !== undefined ? !!isTop : existingNote.isTop,
+            isShare: isShare !== undefined ? !!isShare : existingNote.isShare,
+            updatedAt: new Date(),
+            metadata: metadata || existingNote.metadata,
+            _dirty: true,
+            _syncAction: 'update',
+            _isOfflineCreated: existingNote._isOfflineCreated,
+          };
+          await saveNoteLocally(updatedNote);
+          showToast && RootStore.Get(ToastPlugin).success(i18n.t("update-successfully") + '-' + i18n.t("offline-status"));
+          refresh && this.updateTicker++;
+          return updatedNote as unknown as Note;
+        }
       }
 
       const res = await api.notes.upsert.mutate({
@@ -291,6 +347,44 @@ export class BlinkoStore implements Store {
       }
     }
     this.updateTicker++;
+  }
+
+  async syncDirtyNotes() {
+    if (!this.isOnline) return;
+    const dirtyNotes = await getDirtyNotes();
+    for (const note of dirtyNotes) {
+      try {
+        if (note._syncAction === 'create') {
+          const { id: tempId, _dirty, _syncAction, _isOfflineCreated, ...noteData } = note;
+          const serverNote = await api.notes.upsert.mutate({
+            content: noteData.content,
+            type: noteData.type,
+            isArchived: noteData.isArchived,
+            isRecycle: noteData.isRecycle,
+            isTop: noteData.isTop,
+            isShare: noteData.isShare,
+            attachments: noteData.attachments ?? [],
+            references: noteData.references?.map((r: any) => r.toNoteId ?? r) ?? [],
+            metadata: noteData.metadata,
+          });
+          await markSynced(tempId, serverNote);
+        } else if (note._syncAction === 'update') {
+          const serverNote = await api.notes.upsert.mutate({
+            id: note.id,
+            content: note.content,
+            type: note.type,
+            isArchived: note.isArchived,
+            isRecycle: note.isRecycle,
+            isTop: note.isTop,
+            isShare: note.isShare,
+            metadata: note.metadata,
+          });
+          await markSynced(note.id, serverNote);
+        }
+      } catch (error) {
+        console.error('Failed to sync dirty note:', note.id, error);
+      }
+    }
   }
 
   blinkoList = new PromisePageState({
@@ -408,7 +502,16 @@ export class BlinkoStore implements Store {
 
   noteDetail = new PromiseState({
     function: async ({ id }) => {
-      return await api.notes.detail.mutate({ id })
+      if (this.isOnline) {
+        const result = await api.notes.detail.mutate({ id });
+        if (result) {
+          cacheNotes([result]).catch(err => console.warn('Failed to cache note detail:', err));
+        }
+        return result;
+      } else {
+        const cached = await getCachedNote(id);
+        return (cached as unknown as Note) ?? null;
+      }
     }
   })
 
@@ -432,9 +535,14 @@ export class BlinkoStore implements Store {
 
   tagList = new PromiseState({
     function: async () => {
-      const falttenTags = await api.tags.list.query(undefined, { context: { skipBatch: true } });
+      let falttenTags: any[];
+      if (this.isOnline) {
+        falttenTags = await api.tags.list.query(undefined, { context: { skipBatch: true } });
+        cacheTags(falttenTags).catch(err => console.warn('Failed to cache tags:', err));
+      } else {
+        falttenTags = await getCachedTags() as any;
+      }
       const listTags = helper.buildHashTagTreeFromDb(falttenTags)
-      console.log(falttenTags, 'listTags')
       let pathTags: string[] = [];
       listTags.forEach(node => {
         pathTags = pathTags.concat(helper.generateTagPaths(node));
@@ -450,8 +558,17 @@ export class BlinkoStore implements Store {
   config = new PromiseState({
     loadingLock: false,
     function: async () => {
-      const res = await api.config.list.query()
-      return res
+      if (this.isOnline) {
+        const res = await api.config.list.query();
+        try { localStorage.setItem('blinko-cached-config', JSON.stringify(res)); } catch {}
+        return res;
+      } else {
+        try {
+          const cached = localStorage.getItem('blinko-cached-config');
+          if (cached) return JSON.parse(cached);
+        } catch {}
+        return null;
+      }
     }
   })
 
@@ -535,7 +652,23 @@ export class BlinkoStore implements Store {
     // this.updateTicker++
   }
 
+  async migrateOfflineStorage() {
+    for (const note of this.offlineNotes) {
+      const exists = await getCachedNote(note.id);
+      if (!exists) {
+        await saveNoteLocally({
+          ...note,
+          isReviewed: false,
+          _dirty: true,
+          _syncAction: 'create',
+          _isOfflineCreated: true,
+        } as CachedNote);
+      }
+    }
+  }
+
   firstLoad() {
+    this.migrateOfflineStorage().catch(console.warn);
     this.tagList.call()
     this.config.call()
     this.dailyReviewNoteList.call()
@@ -679,6 +812,14 @@ export class BlinkoStore implements Store {
     makeAutoObservable(this)
     eventBus.on('user:signout', () => {
       this.clear()
+      clearOfflineData().catch(console.warn)
+    })
+    eventBus.on('app:online', () => {
+      this.syncDirtyNotes().then(() => {
+        this.syncOfflineNotes().then(() => {
+          this.updateTicker++;
+        });
+      });
     })
   }
 
