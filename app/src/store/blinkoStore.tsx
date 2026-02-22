@@ -182,7 +182,7 @@ export class BlinkoStore implements Store {
 
       if (!this.isOnline && !id) {
         const now = new Date();
-        const tempId = now.getTime();
+        const tempId = now.getTime() * 1000 + Math.floor(Math.random() * 1000);
         const offlineNote: CachedNote = {
           id: tempId,
           content: content || '',
@@ -222,6 +222,8 @@ export class BlinkoStore implements Store {
             isShare: isShare !== undefined ? !!isShare : existingNote.isShare,
             updatedAt: new Date(),
             metadata: metadata !== undefined ? metadata : existingNote.metadata,
+            attachments: params.attachments !== undefined ? (params.attachments || []) : existingNote.attachments,
+            references: params.references !== undefined ? params.references.map(refId => ({ toNoteId: refId })) : existingNote.references,
             _dirty: true,
             _syncAction: existingNote._isOfflineCreated ? 'create' : 'update',
             _isOfflineCreated: existingNote._isOfflineCreated,
@@ -312,6 +314,8 @@ export class BlinkoStore implements Store {
               isRecycle: note.isRecycle,
               isTop: note.isTop,
               isShare: note.isShare,
+              attachments: note.attachments ?? [],
+              references: note.references?.map((r: any) => r.toNoteId ?? r) ?? [],
               metadata: note.metadata,
             });
             await markSynced(note.id, serverNote);
@@ -602,10 +606,10 @@ export class BlinkoStore implements Store {
   firstLoad() {
     this.migrateOfflineStorage()
       .then(() => {
-        // Sync any dirty notes from previous offline sessions
+        // Sync any dirty notes from previous offline sessions (no updateTicker bump -
+        // initial data loads are already triggered by the direct calls below)
         if (this.isOnline) {
           this.syncDirtyNotes()
-            .then(() => this.updateTicker++)
             .catch(err => console.warn('Failed to sync on load:', err));
         }
       })

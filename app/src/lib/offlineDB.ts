@@ -56,6 +56,8 @@ export async function cacheNotes(notes: any[]): Promise<void> {
       if (existing && existing._dirty) continue; // Don't overwrite locally modified notes
       await offlineDB.notes.put({
         ...note,
+        createdAt: new Date(note.createdAt),
+        updatedAt: new Date(note.updatedAt),
         _dirty: false,
         _syncAction: undefined,
         _isOfflineCreated: false,
@@ -105,6 +107,8 @@ export async function markSynced(tempId: number, serverNote: any): Promise<void>
     }
     await offlineDB.notes.put({
       ...serverNote,
+      createdAt: new Date(serverNote.createdAt),
+      updatedAt: new Date(serverNote.updatedAt),
       _dirty: false,
       _syncAction: undefined,
       _isOfflineCreated: false,
