@@ -50,13 +50,18 @@ class BlinkoOfflineDB extends Dexie {
 export const offlineDB = new BlinkoOfflineDB();
 
 export async function cacheNotes(notes: any[]): Promise<void> {
-  const records: CachedNote[] = notes.map(note => ({
-    ...note,
-    _dirty: false,
-    _syncAction: undefined,
-    _isOfflineCreated: false,
-  }));
-  await offlineDB.notes.bulkPut(records);
+  await offlineDB.transaction('rw', offlineDB.notes, async () => {
+    for (const note of notes) {
+      const existing = await offlineDB.notes.get(note.id);
+      if (existing && existing._dirty) continue; // Don't overwrite locally modified notes
+      await offlineDB.notes.put({
+        ...note,
+        _dirty: false,
+        _syncAction: undefined,
+        _isOfflineCreated: false,
+      });
+    }
+  });
 }
 
 export async function getCachedNotes(params: {
@@ -94,14 +99,16 @@ export async function getDirtyNotes(): Promise<CachedNote[]> {
 }
 
 export async function markSynced(tempId: number, serverNote: any): Promise<void> {
-  if (tempId !== serverNote.id) {
-    await offlineDB.notes.delete(tempId);
-  }
-  await offlineDB.notes.put({
-    ...serverNote,
-    _dirty: false,
-    _syncAction: undefined,
-    _isOfflineCreated: false,
+  await offlineDB.transaction('rw', offlineDB.notes, async () => {
+    if (tempId !== serverNote.id) {
+      await offlineDB.notes.delete(tempId);
+    }
+    await offlineDB.notes.put({
+      ...serverNote,
+      _dirty: false,
+      _syncAction: undefined,
+      _isOfflineCreated: false,
+    });
   });
 }
 
